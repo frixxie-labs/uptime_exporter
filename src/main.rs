@@ -1,3 +1,4 @@
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use axum::Router;
@@ -5,29 +6,40 @@ use axum::extract::{MatchedPath, Request, State};
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::get;
-use clap::Parser;
+use clap::{ArgGroup, Parser};
 use metrics::{describe_gauge, gauge, histogram};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use tokio::net::TcpListener;
+use tokio::process::Command;
 use tokio::task::JoinSet;
 use tower::ServiceBuilder;
 use tower_http::trace::TraceLayer;
 use tracing::{Level, error, info, instrument};
 use tracing_subscriber::FmtSubscriber;
 
-/// Probes a list of URLs on an interval and exposes the results as Prometheus metrics.
+/// Probes HTTP URLs and ping addresses on an interval and exposes the results as Prometheus metrics.
 #[derive(Parser, Debug)]
 #[command(name = "uptime_exporter", version, about)]
+#[command(group(
+    ArgGroup::new("targets")
+        .required(true)
+        .multiple(true)
+        .args(["urls", "ping_addresses"])
+))]
 struct Args {
-    /// URLs to probe with GET requests
-    #[arg(required = true)]
+    /// URLs to probe with HTTP GET requests
+    #[arg(value_name = "URL")]
     urls: Vec<String>,
 
-    /// How often to (re-)probe each URL, in seconds
+    /// Addresses to probe with ICMP ping
+    #[arg(long = "ping", value_name = "ADDRESS")]
+    ping_addresses: Vec<String>,
+
+    /// How often to (re-)probe each target, in seconds
     #[arg(
         long,
         env = "UPTIME_EXPORTER_INTERVAL",
-        default_value_t = 15,
+        default_value_t = 30,
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     interval: u64,
@@ -39,6 +51,77 @@ struct Args {
     /// Logging level for the application.
     #[arg(long, env = "UPTIME_EXPORTER_LOG_LEVEL", default_value = "info")]
     log_level: LogLevel,
+}
+
+impl Args {
+    fn targets(&self) -> Vec<ProbeTarget> {
+        self.urls
+            .iter()
+            .cloned()
+            .map(ProbeTarget::http)
+            .chain(self.ping_addresses.iter().cloned().map(ProbeTarget::ping))
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeKind {
+    Http,
+    Ping,
+}
+
+impl ProbeKind {
+    fn as_label(self) -> &'static str {
+        match self {
+            ProbeKind::Http => "http",
+            ProbeKind::Ping => "ping",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProbeTarget {
+    Http { url: String },
+    Ping { address: String },
+}
+
+impl ProbeTarget {
+    fn http(url: String) -> Self {
+        ProbeTarget::Http { url }
+    }
+
+    fn ping(address: String) -> Self {
+        ProbeTarget::Ping { address }
+    }
+
+    fn kind(&self) -> ProbeKind {
+        match self {
+            ProbeTarget::Http { .. } => ProbeKind::Http,
+            ProbeTarget::Ping { .. } => ProbeKind::Ping,
+        }
+    }
+
+    fn label(&self) -> &str {
+        match self {
+            ProbeTarget::Http { url } => url,
+            ProbeTarget::Ping { address } => address,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeOutcome {
+    Http { status: u16 },
+    Ping { success: bool },
+}
+
+impl ProbeOutcome {
+    fn is_success(self) -> bool {
+        match self {
+            ProbeOutcome::Http { status } => is_http_probe_success(status),
+            ProbeOutcome::Ping { success } => success,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -80,11 +163,11 @@ impl From<LogLevel> for Level {
 fn describe_metrics() {
     describe_gauge!(
         "probe_success",
-        "Whether the probe returned HTTP 200 OK (1) or not (0)"
+        "Whether the probe succeeded (HTTP 200 OK or ping response) (1) or not (0)"
     );
     describe_gauge!(
         "probe_http_status_code",
-        "HTTP status code returned by the probe (0 if the request failed)"
+        "HTTP status code returned by an HTTP probe (0 if the request failed)"
     );
     describe_gauge!(
         "probe_duration_seconds",
@@ -92,14 +175,20 @@ fn describe_metrics() {
     );
 }
 
-/// Records the outcome of a single probe for `url`.
-fn record_probe(url: &str, status: u16, elapsed_secs: f64) {
-    let labels = [("url", url.to_string())];
-    let success = if is_probe_success(status) { 1.0 } else { 0.0 };
+/// Records the outcome of a single probe for `target`.
+fn record_probe(target: &ProbeTarget, outcome: ProbeOutcome, elapsed_secs: f64) {
+    let labels = [
+        ("probe_type", target.kind().as_label().to_string()),
+        ("target", target.label().to_string()),
+    ];
+    let success = if outcome.is_success() { 1.0 } else { 0.0 };
 
     gauge!("probe_success", &labels).set(success);
-    gauge!("probe_http_status_code", &labels).set(status as f64);
     gauge!("probe_duration_seconds", &labels).set(elapsed_secs);
+
+    if let ProbeOutcome::Http { status } = outcome {
+        gauge!("probe_http_status_code", &labels).set(status as f64);
+    }
 }
 
 /// Whether an HTTP status code should be considered a successful probe.
@@ -107,32 +196,75 @@ fn record_probe(url: &str, status: u16, elapsed_secs: f64) {
 /// Only an exact 200 counts as success, matching the "returns 200 OK" requirement
 /// literally (a 201 or a 301-to-200 redirect target still count, since reqwest
 /// follows redirects and reports the final status; a 204 or 404 do not).
-fn is_probe_success(status: u16) -> bool {
+fn is_http_probe_success(status: u16) -> bool {
     status == 200
 }
 
-/// Runs a single GET request against `url` and records the outcome.
-#[instrument(skip(client))]
-async fn probe_once(client: &reqwest::Client, url: &str) {
-    let start = Instant::now();
-    let result = client.get(url).send().await;
-    let elapsed = start.elapsed().as_secs_f64();
+fn ping_args(address: &str) -> [&str; 3] {
+    ["-c", "1", address]
+}
 
-    let status: u16 = match &result {
-        Ok(response) => response.status().as_u16(),
-        Err(_) => 0,
-    };
+async fn ping_address(address: &str) -> std::io::Result<bool> {
+    let mut command = Command::new("ping");
+    command
+        .args(ping_args(address))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
 
-    record_probe(url, status, elapsed);
-
-    match result {
-        Ok(response) => info!("probe {} -> {} ({:.3}s)", url, response.status(), elapsed),
-        Err(err) => error!("probe {} -> error: {err} ({:.3}s)", url, elapsed),
+    let mut child = command.spawn()?;
+    match tokio::time::timeout(Duration::from_secs(10), child.wait()).await {
+        Ok(status) => status.map(|status| status.success()),
+        Err(_) => {
+            let _ = child.kill().await;
+            Ok(false)
+        }
     }
 }
 
-/// Probes every URL concurrently, then waits for `interval` before repeating, forever.
-async fn probe_loop(urls: Vec<String>, interval: Duration) {
+/// Runs a single probe against `target` and records the outcome.
+#[instrument(skip(client))]
+async fn probe_once(client: &reqwest::Client, target: &ProbeTarget) {
+    let start = Instant::now();
+
+    match target {
+        ProbeTarget::Http { url } => {
+            let result = client.get(url).send().await;
+            let elapsed = start.elapsed().as_secs_f64();
+            let status = match &result {
+                Ok(response) => response.status().as_u16(),
+                Err(_) => 0,
+            };
+
+            record_probe(target, ProbeOutcome::Http { status }, elapsed);
+
+            match result {
+                Ok(response) => info!(
+                    "http probe {} -> {} ({:.3}s)",
+                    url,
+                    response.status(),
+                    elapsed
+                ),
+                Err(err) => error!("http probe {} -> error: {err} ({:.3}s)", url, elapsed),
+            }
+        }
+        ProbeTarget::Ping { address } => {
+            let result = ping_address(address).await;
+            let elapsed = start.elapsed().as_secs_f64();
+            let success = matches!(&result, Ok(true));
+
+            record_probe(target, ProbeOutcome::Ping { success }, elapsed);
+
+            match result {
+                Ok(true) => info!("ping probe {} -> success ({:.3}s)", address, elapsed),
+                Ok(false) => info!("ping probe {} -> failure ({:.3}s)", address, elapsed),
+                Err(err) => error!("ping probe {} -> error: {err} ({:.3}s)", address, elapsed),
+            }
+        }
+    }
+}
+
+/// Probes every target concurrently, then waits for `interval` before repeating, forever.
+async fn probe_loop(targets: Vec<ProbeTarget>, interval: Duration) {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
@@ -143,11 +275,11 @@ async fn probe_loop(urls: Vec<String>, interval: Duration) {
         ticker.tick().await;
 
         let mut set = JoinSet::new();
-        for url in &urls {
+        for target in &targets {
             let client = client.clone();
-            let url = url.clone();
+            let target = target.clone();
             set.spawn(async move {
-                probe_once(&client, &url).await;
+                probe_once(&client, &target).await;
             });
         }
         while set.join_next().await.is_some() {}
@@ -209,7 +341,9 @@ async fn main() -> Result<(), anyhow::Error> {
     describe_metrics();
 
     let interval = Duration::from_secs(args.interval);
-    tokio::spawn(probe_loop(args.urls.clone(), interval));
+    let targets = args.targets();
+    let target_count = targets.len();
+    tokio::spawn(probe_loop(targets, interval));
 
     let app = create_router(prometheus);
 
@@ -219,9 +353,8 @@ async fn main() -> Result<(), anyhow::Error> {
         .unwrap_or_else(|err| panic!("failed to bind {addr}: {err}"));
 
     info!(
-        "uptime_exporter listening on http://{addr}/metrics, probing {} url(s) every {}s",
-        args.urls.len(),
-        args.interval
+        "uptime_exporter listening on http://{addr}/metrics, probing {} target(s) every {}s",
+        target_count, args.interval
     );
 
     axum::serve(listener, app)
@@ -282,38 +415,83 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // is_probe_success
+    // ProbeKind / ProbeTarget / ProbeOutcome / is_http_probe_success
     // ---------------------------------------------------------------------
 
     #[test]
-    fn success_only_for_exact_200() {
-        assert!(is_probe_success(200));
-        assert!(!is_probe_success(0));
-        assert!(!is_probe_success(199));
-        assert!(!is_probe_success(201));
-        assert!(!is_probe_success(301));
-        assert!(!is_probe_success(404));
-        assert!(!is_probe_success(500));
-        assert!(!is_probe_success(u16::MAX));
+    fn probe_kind_labels_are_stable() {
+        assert_eq!(ProbeKind::Http.as_label(), "http");
+        assert_eq!(ProbeKind::Ping.as_label(), "ping");
+    }
+
+    #[test]
+    fn probe_targets_expose_kind_and_label() {
+        let http = ProbeTarget::http("https://example.com".to_string());
+        let ping = ProbeTarget::ping("127.0.0.1".to_string());
+
+        assert_eq!(http.kind(), ProbeKind::Http);
+        assert_eq!(http.label(), "https://example.com");
+        assert_eq!(ping.kind(), ProbeKind::Ping);
+        assert_eq!(ping.label(), "127.0.0.1");
+    }
+
+    #[test]
+    fn probe_outcome_success_depends_on_probe_kind() {
+        assert!(ProbeOutcome::Http { status: 200 }.is_success());
+        assert!(!ProbeOutcome::Http { status: 204 }.is_success());
+        assert!(ProbeOutcome::Ping { success: true }.is_success());
+        assert!(!ProbeOutcome::Ping { success: false }.is_success());
+    }
+
+    #[test]
+    fn http_success_only_for_exact_200() {
+        assert!(is_http_probe_success(200));
+        assert!(!is_http_probe_success(0));
+        assert!(!is_http_probe_success(199));
+        assert!(!is_http_probe_success(201));
+        assert!(!is_http_probe_success(301));
+        assert!(!is_http_probe_success(404));
+        assert!(!is_http_probe_success(500));
+        assert!(!is_http_probe_success(u16::MAX));
     }
 
     #[quickcheck]
-    fn prop_success_iff_status_is_exactly_200(status: u16) -> bool {
-        is_probe_success(status) == (status == 200)
+    fn prop_http_success_iff_status_is_exactly_200(status: u16) -> bool {
+        is_http_probe_success(status) == (status == 200)
+    }
+
+    #[test]
+    fn ping_args_use_one_packet_on_unix() {
+        assert_eq!(ping_args("127.0.0.1"), ["-c", "1", "127.0.0.1"]);
     }
 
     // ---------------------------------------------------------------------
     // record_probe + metrics_handler
     // ---------------------------------------------------------------------
 
-    /// Records a single outcome into a fresh recorder and returns the rendered body.
-    fn rendered(url: &str, status: u16, elapsed: f64) -> String {
-        recorded(|_| record_probe(url, status, elapsed)).0
+    fn http_metric(target: &str, metric: &str, value: impl std::fmt::Display) -> String {
+        format!("{metric}{{probe_type=\"http\",target=\"{target}\"}} {value}")
+    }
+
+    fn ping_metric(target: &str, metric: &str, value: impl std::fmt::Display) -> String {
+        format!("{metric}{{probe_type=\"ping\",target=\"{target}\"}} {value}")
+    }
+
+    /// Records a single HTTP outcome into a fresh recorder and returns the rendered body.
+    fn rendered_http(url: &str, status: u16, elapsed: f64) -> String {
+        let target = ProbeTarget::http(url.to_string());
+        recorded(|_| record_probe(&target, ProbeOutcome::Http { status }, elapsed)).0
+    }
+
+    /// Records a single ping outcome into a fresh recorder and returns the rendered body.
+    fn rendered_ping(address: &str, success: bool, elapsed: f64) -> String {
+        let target = ProbeTarget::ping(address.to_string());
+        recorded(|_| record_probe(&target, ProbeOutcome::Ping { success }, elapsed)).0
     }
 
     #[test]
     fn exposes_help_and_type_for_all_three_metrics() {
-        let body = rendered("https://example.com", 200, 0.25);
+        let body = rendered_http("https://example.com", 200, 0.25);
 
         assert!(body.contains("# HELP probe_success"));
         assert!(body.contains("# TYPE probe_success gauge"));
@@ -325,54 +503,109 @@ mod tests {
 
     #[test]
     fn record_200_is_success() {
-        let body = rendered("https://example.com", 200, 0.25);
-        assert!(body.contains("probe_success{url=\"https://example.com\"} 1"));
-        assert!(body.contains("probe_http_status_code{url=\"https://example.com\"} 200"));
-        assert!(body.contains("probe_duration_seconds{url=\"https://example.com\"} 0.25"));
+        let body = rendered_http("https://example.com", 200, 0.25);
+        assert!(body.contains(&http_metric("https://example.com", "probe_success", 1)));
+        assert!(body.contains(&http_metric(
+            "https://example.com",
+            "probe_http_status_code",
+            200
+        )));
+        assert!(body.contains(&http_metric(
+            "https://example.com",
+            "probe_duration_seconds",
+            0.25
+        )));
     }
 
     #[test]
     fn record_404_is_failure() {
-        let body = rendered("https://example.com", 404, 0.1);
-        assert!(body.contains("probe_success{url=\"https://example.com\"} 0"));
-        assert!(body.contains("probe_http_status_code{url=\"https://example.com\"} 404"));
+        let body = rendered_http("https://example.com", 404, 0.1);
+        assert!(body.contains(&http_metric("https://example.com", "probe_success", 0)));
+        assert!(body.contains(&http_metric(
+            "https://example.com",
+            "probe_http_status_code",
+            404
+        )));
     }
 
     #[test]
     fn record_500_is_failure() {
-        let body = rendered("https://example.com", 500, 0.1);
-        assert!(body.contains("probe_success{url=\"https://example.com\"} 0"));
-        assert!(body.contains("probe_http_status_code{url=\"https://example.com\"} 500"));
+        let body = rendered_http("https://example.com", 500, 0.1);
+        assert!(body.contains(&http_metric("https://example.com", "probe_success", 0)));
+        assert!(body.contains(&http_metric(
+            "https://example.com",
+            "probe_http_status_code",
+            500
+        )));
     }
 
     #[test]
     fn record_connection_failure_is_status_zero() {
-        let body = rendered("https://unreachable.example", 0, 0.0);
-        assert!(body.contains("probe_success{url=\"https://unreachable.example\"} 0"));
-        assert!(body.contains("probe_http_status_code{url=\"https://unreachable.example\"} 0"));
+        let body = rendered_http("https://unreachable.example", 0, 0.0);
+        assert!(body.contains(&http_metric(
+            "https://unreachable.example",
+            "probe_success",
+            0
+        )));
+        assert!(body.contains(&http_metric(
+            "https://unreachable.example",
+            "probe_http_status_code",
+            0
+        )));
+    }
+
+    #[test]
+    fn record_ping_success_is_success() {
+        let body = rendered_ping("127.0.0.1", true, 0.25);
+        assert!(body.contains(&ping_metric("127.0.0.1", "probe_success", 1)));
+        assert!(body.contains(&ping_metric("127.0.0.1", "probe_duration_seconds", 0.25)));
+    }
+
+    #[test]
+    fn record_ping_failure_is_failure_without_http_status_series() {
+        let body = rendered_ping("192.0.2.1", false, 0.1);
+        assert!(body.contains(&ping_metric("192.0.2.1", "probe_success", 0)));
+        assert!(!body.contains("probe_http_status_code{probe_type=\"ping\",target=\"192.0.2.1\"}"));
     }
 
     #[test]
     fn distinct_urls_get_distinct_label_series() {
+        let a = ProbeTarget::http("https://a.example".to_string());
+        let b = ProbeTarget::http("https://b.example".to_string());
         let body = recorded(|_| {
-            record_probe("https://a.example", 200, 0.1);
-            record_probe("https://b.example", 404, 0.2);
+            record_probe(&a, ProbeOutcome::Http { status: 200 }, 0.1);
+            record_probe(&b, ProbeOutcome::Http { status: 404 }, 0.2);
         })
         .0;
-        assert!(body.contains("probe_success{url=\"https://a.example\"} 1"));
-        assert!(body.contains("probe_success{url=\"https://b.example\"} 0"));
+        assert!(body.contains(&http_metric("https://a.example", "probe_success", 1)));
+        assert!(body.contains(&http_metric("https://b.example", "probe_success", 0)));
+    }
+
+    #[test]
+    fn http_and_ping_targets_get_distinct_label_series() {
+        let http = ProbeTarget::http("https://example.com".to_string());
+        let ping = ProbeTarget::ping("example.com".to_string());
+        let body = recorded(|_| {
+            record_probe(&http, ProbeOutcome::Http { status: 200 }, 0.1);
+            record_probe(&ping, ProbeOutcome::Ping { success: true }, 0.2);
+        })
+        .0;
+
+        assert!(body.contains(&http_metric("https://example.com", "probe_success", 1)));
+        assert!(body.contains(&ping_metric("example.com", "probe_success", 1)));
     }
 
     #[tokio::test]
     async fn metrics_handler_renders_prometheus_text_format() {
         let (_, handler_body) = recorded_async(|handle| async move {
-            record_probe("https://example.com", 200, 0.25);
+            let target = ProbeTarget::http("https://example.com".to_string());
+            record_probe(&target, ProbeOutcome::Http { status: 200 }, 0.25);
             metrics_handler(State(handle)).await
         })
         .await;
 
         assert!(handler_body.contains("# HELP probe_success"));
-        assert!(handler_body.contains("probe_success{url=\"https://example.com\"} 1"));
+        assert!(handler_body.contains(&http_metric("https://example.com", "probe_success", 1)));
     }
 
     /// Characters that are safe to use unescaped inside a Prometheus label value
@@ -402,13 +635,13 @@ mod tests {
         let elapsed = elapsed_millis as f64 / 1000.0;
         let expected_success = if status == 200 { 1 } else { 0 };
 
-        let body = rendered(&label.0, status, elapsed);
+        let body = rendered_http(&label.0, status, elapsed);
 
         body.contains(&format!(
-            "probe_success{{url=\"{}\"}} {expected_success}",
+            "probe_success{{probe_type=\"http\",target=\"{}\"}} {expected_success}",
             label.0
         )) && body.contains(&format!(
-            "probe_http_status_code{{url=\"{}\"}} {status}",
+            "probe_http_status_code{{probe_type=\"http\",target=\"{}\"}} {status}",
             label.0
         ))
     }
@@ -418,11 +651,12 @@ mod tests {
     // ---------------------------------------------------------------------
 
     #[test]
-    fn defaults_are_15s_interval_and_9200_port() {
+    fn defaults_are_30s_interval_and_9200_port() {
         let args = Args::try_parse_from(["uptime_exporter", "https://example.com"]).unwrap();
-        assert_eq!(args.interval, 15);
+        assert_eq!(args.interval, 30);
         assert_eq!(args.port, 9200);
         assert_eq!(args.urls, vec!["https://example.com".to_string()]);
+        assert!(args.ping_addresses.is_empty());
         assert!(matches!(args.log_level, LogLevel::Info));
     }
 
@@ -450,10 +684,49 @@ mod tests {
                 "https://b.example".to_string()
             ]
         );
+        assert!(args.ping_addresses.is_empty());
     }
 
     #[test]
-    fn rejects_missing_urls() {
+    fn parses_ping_addresses_without_urls() {
+        let args = Args::try_parse_from(["uptime_exporter", "--ping", "127.0.0.1"]).unwrap();
+        assert!(args.urls.is_empty());
+        assert_eq!(args.ping_addresses, vec!["127.0.0.1".to_string()]);
+        assert_eq!(
+            args.targets(),
+            vec![ProbeTarget::ping("127.0.0.1".to_string())]
+        );
+    }
+
+    #[test]
+    fn parses_mixed_http_and_ping_targets() {
+        let args = Args::try_parse_from([
+            "uptime_exporter",
+            "--ping",
+            "127.0.0.1",
+            "https://example.com",
+            "--ping",
+            "example.com",
+        ])
+        .unwrap();
+
+        assert_eq!(args.urls, vec!["https://example.com".to_string()]);
+        assert_eq!(
+            args.ping_addresses,
+            vec!["127.0.0.1".to_string(), "example.com".to_string()]
+        );
+        assert_eq!(
+            args.targets(),
+            vec![
+                ProbeTarget::http("https://example.com".to_string()),
+                ProbeTarget::ping("127.0.0.1".to_string()),
+                ProbeTarget::ping("example.com".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_missing_targets() {
         assert!(Args::try_parse_from(["uptime_exporter"]).is_err());
     }
 
@@ -575,7 +848,48 @@ mod tests {
             Ok(args) => {
                 let mut expected_urls = vec![first_url.0.clone()];
                 expected_urls.extend(rest_urls.iter().map(|u| u.0.clone()));
-                args.interval == interval && args.port == port && args.urls == expected_urls
+                let expected_targets = expected_urls
+                    .iter()
+                    .cloned()
+                    .map(ProbeTarget::http)
+                    .collect::<Vec<_>>();
+
+                args.interval == interval
+                    && args.port == port
+                    && args.urls == expected_urls
+                    && args.ping_addresses.is_empty()
+                    && args.targets() == expected_targets
+            }
+            Err(_) => false,
+        }
+    }
+
+    #[quickcheck]
+    fn prop_cli_roundtrips_ping_addresses(
+        first_address: SafeArg,
+        rest_addresses: Vec<SafeArg>,
+    ) -> bool {
+        let mut argv = vec!["uptime_exporter".to_string()];
+        argv.push("--ping".to_string());
+        argv.push(first_address.0.clone());
+        for address in &rest_addresses {
+            argv.push("--ping".to_string());
+            argv.push(address.0.clone());
+        }
+
+        match Args::try_parse_from(&argv) {
+            Ok(args) => {
+                let mut expected_addresses = vec![first_address.0.clone()];
+                expected_addresses.extend(rest_addresses.iter().map(|address| address.0.clone()));
+                let expected_targets = expected_addresses
+                    .iter()
+                    .cloned()
+                    .map(ProbeTarget::ping)
+                    .collect::<Vec<_>>();
+
+                args.urls.is_empty()
+                    && args.ping_addresses == expected_addresses
+                    && args.targets() == expected_targets
             }
             Err(_) => false,
         }
@@ -589,42 +903,45 @@ mod tests {
     async fn probe_once_records_200_as_success() {
         let client = reqwest::Client::new();
         let url = test_server(200).await;
+        let target = ProbeTarget::http(url.clone());
 
         let body = recorded_async(|_| async {
-            probe_once(&client, &url).await;
+            probe_once(&client, &target).await;
         })
         .await
         .0;
-        assert!(body.contains(&format!("probe_success{{url=\"{url}\"}} 1")));
-        assert!(body.contains(&format!("probe_http_status_code{{url=\"{url}\"}} 200")));
+        assert!(body.contains(&http_metric(&url, "probe_success", 1)));
+        assert!(body.contains(&http_metric(&url, "probe_http_status_code", 200)));
     }
 
     #[tokio::test]
     async fn probe_once_records_404_as_failure() {
         let client = reqwest::Client::new();
         let url = test_server(404).await;
+        let target = ProbeTarget::http(url.clone());
 
         let body = recorded_async(|_| async {
-            probe_once(&client, &url).await;
+            probe_once(&client, &target).await;
         })
         .await
         .0;
-        assert!(body.contains(&format!("probe_success{{url=\"{url}\"}} 0")));
-        assert!(body.contains(&format!("probe_http_status_code{{url=\"{url}\"}} 404")));
+        assert!(body.contains(&http_metric(&url, "probe_success", 0)));
+        assert!(body.contains(&http_metric(&url, "probe_http_status_code", 404)));
     }
 
     #[tokio::test]
     async fn probe_once_records_500_as_failure() {
         let client = reqwest::Client::new();
         let url = test_server(500).await;
+        let target = ProbeTarget::http(url.clone());
 
         let body = recorded_async(|_| async {
-            probe_once(&client, &url).await;
+            probe_once(&client, &target).await;
         })
         .await
         .0;
-        assert!(body.contains(&format!("probe_success{{url=\"{url}\"}} 0")));
-        assert!(body.contains(&format!("probe_http_status_code{{url=\"{url}\"}} 500")));
+        assert!(body.contains(&http_metric(&url, "probe_success", 0)));
+        assert!(body.contains(&http_metric(&url, "probe_http_status_code", 500)));
     }
 
     #[tokio::test]
@@ -636,14 +953,15 @@ mod tests {
         // Port 0 is never a valid connection target, so this fails immediately and
         // deterministically without depending on any external network state.
         let url = "http://127.0.0.1:0/";
+        let target = ProbeTarget::http(url.to_string());
 
         let body = recorded_async(|_| async {
-            probe_once(&client, url).await;
+            probe_once(&client, &target).await;
         })
         .await
         .0;
-        assert!(body.contains(&format!("probe_success{{url=\"{url}\"}} 0")));
-        assert!(body.contains(&format!("probe_http_status_code{{url=\"{url}\"}} 0")));
+        assert!(body.contains(&http_metric(url, "probe_success", 0)));
+        assert!(body.contains(&http_metric(url, "probe_http_status_code", 0)));
     }
 
     // ---------------------------------------------------------------------
@@ -654,16 +972,21 @@ mod tests {
     async fn probe_loop_probes_all_urls_concurrently_on_each_tick() {
         let server = test_server(200).await;
         let urls = vec![format!("{server}/a"), format!("{server}/b")];
+        let targets = urls
+            .iter()
+            .cloned()
+            .map(ProbeTarget::http)
+            .collect::<Vec<_>>();
 
         let body = recorded_async(|_| async {
-            let handle = tokio::spawn(probe_loop(urls.clone(), Duration::from_millis(20)));
+            let handle = tokio::spawn(probe_loop(targets.clone(), Duration::from_millis(20)));
             tokio::time::sleep(Duration::from_millis(150)).await;
             handle.abort();
         })
         .await
         .0;
         for url in &urls {
-            assert!(body.contains(&format!("probe_success{{url=\"{url}\"}} 1")));
+            assert!(body.contains(&http_metric(url, "probe_success", 1)));
         }
     }
 }
