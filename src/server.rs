@@ -2,6 +2,7 @@ use std::time::Instant;
 
 use axum::Router;
 use axum::extract::{MatchedPath, Request, State};
+use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::get;
@@ -41,9 +42,15 @@ async fn metrics_handler(State(handle): State<PrometheusHandle>) -> String {
     handle.render()
 }
 
+#[instrument]
+async fn ping_handler() -> StatusCode {
+    StatusCode::OK
+}
+
 pub fn create_router(prometheus: PrometheusHandle) -> Router {
     Router::new()
         .route("/metrics", get(metrics_handler))
+        .route("/status/ping", get(ping_handler))
         .with_state(prometheus)
         .layer(
             ServiceBuilder::new()
@@ -55,6 +62,10 @@ pub fn create_router(prometheus: PrometheusHandle) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
 
     use crate::metrics::record_probe;
     use crate::probe::{ProbeOutcome, ProbeTarget};
@@ -71,5 +82,23 @@ mod tests {
 
         assert!(handler_body.contains("# HELP probe_success"));
         assert!(handler_body.contains(&http_metric("https://example.com", "probe_success", 1)));
+    }
+
+    #[tokio::test]
+    async fn status_ping_returns_ok() {
+        let (_, response) = recorded_async(|handle| async move {
+            create_router(handle)
+                .oneshot(
+                    Request::builder()
+                        .uri("/status/ping")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        })
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }
