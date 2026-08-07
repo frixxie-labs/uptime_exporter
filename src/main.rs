@@ -40,9 +40,10 @@ async fn main() -> Result<(), anyhow::Error> {
         .unwrap_or_else(|err| panic!("failed to bind {addr}: {err}"));
 
     info!(
-        "uptime_exporter listening on http://{addr}/metrics, probing {} target(s) every {}s",
+        address = %addr,
         target_count,
-        args.interval_secs()
+        interval_seconds = args.interval_secs(),
+        "uptime_exporter started"
     );
 
     axum::serve(listener, app)

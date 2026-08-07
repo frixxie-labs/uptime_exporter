@@ -9,6 +9,7 @@
 - Concurrent probing across all configured targets.
 - Prometheus metrics served from `/metrics`.
 - Docker image support, including `ping` and CA certificates in the runtime image.
+- Structured JSON logs suitable for VictoriaLogs ingestion.
 
 ## Metrics
 
@@ -65,6 +66,16 @@ At least one URL or ping address is required.
 | `--ping <ADDRESS>` | | | Address to probe with ICMP ping. May be repeated. |
 
 HTTP URLs are positional arguments and may also be repeated.
+
+## Logging
+
+Logs are written to standard output as newline-delimited JSON. To ingest them through VictoriaLogs' JSON stream API, configure the collector to send each line to:
+
+```text
+http://victorialogs:9428/insert/jsonline?_time_field=timestamp&_msg_field=message
+```
+
+Probe logs include `probe_type`, `target`, `success`, and `duration_seconds` fields. HTTP request logs include `method`, `path`, `status_code`, and `duration_milliseconds` fields.
 
 ## Docker
 

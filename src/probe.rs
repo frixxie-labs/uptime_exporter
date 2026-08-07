@@ -115,12 +115,21 @@ async fn probe_once(client: &reqwest::Client, target: &ProbeTarget) {
 
             match result {
                 Ok(response) => info!(
-                    "http probe {} -> {} ({:.3}s)",
-                    url,
-                    response.status(),
-                    elapsed
+                    probe_type = "http",
+                    target = %url,
+                    status_code = response.status().as_u16(),
+                    success = response.status() == reqwest::StatusCode::OK,
+                    duration_seconds = elapsed,
+                    "probe completed"
                 ),
-                Err(err) => error!("http probe {} -> error: {err} ({:.3}s)", url, elapsed),
+                Err(err) => error!(
+                    probe_type = "http",
+                    target = %url,
+                    success = false,
+                    duration_seconds = elapsed,
+                    error = %err,
+                    "probe failed"
+                ),
             }
         }
         ProbeTarget::Ping { address } => {
@@ -131,9 +140,21 @@ async fn probe_once(client: &reqwest::Client, target: &ProbeTarget) {
             record_probe(target, ProbeOutcome::Ping { success }, elapsed);
 
             match result {
-                Ok(true) => info!("ping probe {} -> success ({:.3}s)", address, elapsed),
-                Ok(false) => info!("ping probe {} -> failure ({:.3}s)", address, elapsed),
-                Err(err) => error!("ping probe {} -> error: {err} ({:.3}s)", address, elapsed),
+                Ok(success) => info!(
+                    probe_type = "ping",
+                    target = %address,
+                    success,
+                    duration_seconds = elapsed,
+                    "probe completed"
+                ),
+                Err(err) => error!(
+                    probe_type = "ping",
+                    target = %address,
+                    success = false,
+                    duration_seconds = elapsed,
+                    error = %err,
+                    "probe failed"
+                ),
             }
         }
     }

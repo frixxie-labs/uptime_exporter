@@ -19,7 +19,7 @@ async fn profile_endpoint(request: Request, next: Next) -> Response {
         .get::<MatchedPath>()
         .map(|p| p.as_str().to_string())
         .unwrap_or_else(|| request.uri().path().to_string());
-    info!("Handling {} at {}", method, path);
+    info!(method, path, "request started");
 
     let now = Instant::now();
     let labels = [("method", method.clone()), ("path", path.clone())];
@@ -29,10 +29,11 @@ async fn profile_endpoint(request: Request, next: Next) -> Response {
     ::metrics::histogram!("handler", &labels).record(elapsed);
 
     info!(
-        "Finished handling {} at {}, used {} ms",
         method,
         path,
-        elapsed.as_millis()
+        status_code = response.status().as_u16(),
+        duration_milliseconds = elapsed.as_millis(),
+        "request completed"
     );
     response
 }

@@ -39,7 +39,15 @@ impl From<LogLevel> for Level {
 
 pub fn init(log_level: LogLevel) {
     let level: Level = log_level.into();
-    let subscriber = FmtSubscriber::builder().with_max_level(level).finish();
+    let subscriber = FmtSubscriber::builder()
+        .with_max_level(level)
+        .json()
+        .flatten_event(true)
+        .with_current_span(false)
+        .with_span_list(false)
+        .with_target(false)
+        .with_ansi(false)
+        .finish();
 
     tracing::subscriber::set_global_default(subscriber).unwrap();
 }
