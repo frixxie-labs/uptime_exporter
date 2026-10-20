@@ -6,13 +6,13 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.104"
 axum = { version = "0.8.9", features = ["macros"] }
-clap = { version = "4.6.5", features = ["derive", "env"] }
+clap = { version = "4.6.7", features = ["derive", "env"] }
 metrics = "0.24.6"
 metrics-exporter-prometheus = "0.18.3"
-reqwest = "0.13.4"
-tokio = { version = "1.53.1", features = ["full"] }
+reqwest = "0.13.5"
+tokio = { version = "1.54.0", features = ["full"] }
 tower = { version = "0.5.3", features = ["tracing", "load"] }
-tower-http = { version = "0.7.0", features = ["trace", "full"] }
+tower-http = { version = "0.7.1", features = ["trace", "full"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["json", "tracing"] }
 
